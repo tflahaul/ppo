@@ -1,15 +1,26 @@
 from flax.training.train_state import TrainState
 from flax.training import checkpoints
-from flax import linen as nn
-from typing import NamedTuple
+from typing import NamedTuple, Tuple
+from pathlib import Path
+from functools import partial
+from model import ActorCritic
 
-import os
 import jax
 import jax.numpy as jnp
 import fire
 import optax
 import distrax
 import gymnasium as gym
+
+
+class Metrics(NamedTuple):
+	loss: float
+	ploss: float
+	vloss: float
+	eloss: float
+
+	def __str__(self) -> str:
+		return f"loss: {self.loss:.3f}, ploss: {self.ploss:.3f}, vloss: {self.vloss:.3f}, ent_loss: {self.eloss:.3f}"
 
 
 class Transition(NamedTuple):
@@ -21,162 +32,163 @@ class Transition(NamedTuple):
 	obs: jnp.ndarray
 
 
-class FFN(nn.Module):
-	hidden_dim: int
-
-	@nn.compact
-	def __call__(self, inputs: jax.Array) -> jax.Array:
-		x = nn.RMSNorm()(inputs)
-		ffn_out = nn.relu(nn.Dense(features=self.hidden_dim)(x))
-		ffn_out = nn.relu(nn.Dense(features=self.hidden_dim)(ffn_out))
-		return x + ffn_out
-
-
-class ActorCritic(nn.Module):
-	num_actions: int
-	hidden_dim: int
-
-	@nn.compact
-	def __call__(self, inputs: jax.Array) -> jax.Array:
-		x = nn.Dense(self.hidden_dim)(inputs)
-		x = FFN(self.hidden_dim)(x)
-		x = FFN(self.hidden_dim)(x)
-
-		mu     = nn.Dense(features=self.num_actions, name="actor_mu")(x)
-		logstd = nn.Dense(features=self.num_actions, name="actor_logstd")(x)
-
-		value = FFN(self.hidden_dim)(x)
-		value = FFN(self.hidden_dim)(value)
-		value = nn.Dense(features=self.num_actions, name="critic_out")(value)
-
-		return mu, logstd, jnp.squeeze(value, axis=-1)
-
-
-
-def normalize(x: jax.Array, eps: float = 1e-8) -> jax.Array:
-	return (x - x.mean()) / (eps + x.std())
-
-
-def train_step(state: TrainState, batch: Transition, returns: jax.Array, eps_clip: float):
-
-	@jax.jit
-	def loss_fn(parameters) -> float:
-		mu, logstd, value = state.apply_fn(parameters, batch.obs)
-		pi = distrax.MultivariateNormalDiag(mu, jnp.exp(logstd))
-		log_prob = pi.log_prob(batch.action)
-
-		ratios = jnp.exp(log_prob - batch.log_prob)
-		advantages = normalize(returns - batch.value)
-		surr1 = ratios * advantages
-		surr2 = ratios.clip(1.0 - eps_clip, 1.0 + eps_clip) * advantages
-		policy_loss = -jnp.minimum(surr1, surr2).mean() - 0.01 * pi.entropy().mean()
-
-		value_pred_clipped = batch.value + (value - batch.value).clip(-eps_clip, eps_clip)
-		value_losses = jnp.square(value - returns)
-		value_losses_clipped = jnp.square(value_pred_clipped - returns)
-		value_loss = jnp.maximum(value_losses, value_losses_clipped).mean()
-
-		return policy_loss + value_loss
-
-	loss, grads = jax.value_and_grad(loss_fn)(state.params)
-	new_state = state.apply_gradients(grads=grads)
-	return loss, new_state
-
-
-def collect_trajectory(
+def collect_trajectory_segments(
 	key: jax.random.PRNGKey,
 	envs: gym.vector.SyncVectorEnv,
 	state: TrainState,
-	num_steps: int,
-	gamma: float = 0.99,
-	gae_lbd: float = 0.95
-) -> Transition:
+	rollout_steps: int,
+	gamma: float,
+	gae_lbd: float
+) -> Tuple[Transition, jax.Array]:
 	last_obs, _ = envs.reset()
-	transitions = list()
-	for _ in range(num_steps):
+	action_lo = envs.single_action_space.low
+	action_hi = envs.single_action_space.high
+	buffer = []
+
+	for _ in range(rollout_steps):
 		_, key = jax.random.split(key)
 		mu, logstd, value = state.apply_fn(state.params, last_obs)
-		pi = distrax.MultivariateNormalDiag(mu, jnp.exp(logstd))
-		action = pi.sample(seed=key)
-		obsv, reward, terminated, truncated, _ = envs.step(action)
+		dist = distrax.MultivariateNormalDiag(mu, jnp.exp(logstd))
+		action = dist.sample(seed=key)
+		log_prob = dist.log_prob(action)
 
-		transitions.append(Transition(
+		obsv, reward, terminated, truncated, _ = envs.step(action)
+		buffer.append(Transition(
 			jnp.logical_or(terminated, truncated),
-			action,
+			jnp.clip(action, action_lo, action_hi),
 			value,
-			reward,
-			pi.log_prob(action),
+			(reward + 8) / 8,  # normalize
+			log_prob,
 			last_obs
 		))
 
 		last_obs = obsv
 
-	transitions = jax.tree.map(lambda *x: jnp.stack(x), *transitions)
-
-	mu, logstd, last_val = state.apply_fn(state.params, last_obs)
-	returns = jnp.zeros_like(transitions.value)
+	buffer = jax.tree.map(lambda *x: jnp.stack(x), *buffer)
+	_, _, last_value = state.apply_fn(state.params, last_obs)
+	returns = []
 	gae = 0
-	for t in reversed(range(num_steps)):
-		value_tp = last_val if t == num_steps - 1 else transitions.value[t + 1]
-		delta = transitions.reward[t] + gamma * value_tp * (1 - transitions.done[t]) - transitions.value[t]
-		gae = delta + gamma * gae_lbd * (1 - transitions.done[t]) * gae
-		returns = returns.at[t].set(transitions.value[t] + gae)
+	for s in reversed(range(rollout_steps)):
+		value_tp = last_value if s == rollout_steps - 1 else buffer.value[s + 1]
+		delta = buffer.reward[s] + gamma * value_tp * (1 - buffer.done[s]) - buffer.value[s]
+		gae = delta + gamma * gae_lbd * (1 - buffer.done[s]) * gae
+		returns.insert(0, gae + buffer.value[s])
 
-	return (transitions, returns)
+	return buffer, jnp.array(returns)
+
+
+@partial(jax.jit, static_argnums=[3, 4, 5, 6])
+def train_step(
+	state: TrainState,
+	buffer: Transition,
+	returns: jax.Array,
+	eps_clip: float,
+	vf_clip: float,
+	vf_coef: float,
+	ent_coef: float
+) -> Tuple[TrainState, Metrics]:
+
+	def loss_fn(parameters):
+		mu, logstd, value = state.apply_fn(parameters, buffer.obs)
+		dist = distrax.MultivariateNormalDiag(mu, jnp.exp(logstd))
+		log_prob = dist.log_prob(buffer.action)
+
+		ratios = jnp.exp(log_prob - buffer.log_prob)
+		advantages = returns - buffer.value
+		advantages = (advantages - advantages.mean()) / (1e-8 + advantages.std())
+		surr1 = -advantages * ratios
+		surr2 = -advantages * ratios.clip(1 - eps_clip, 1 + eps_clip)
+		policy_loss = jnp.mean(jnp.maximum(surr1, surr2))
+
+		value_loss_clipped = buffer.value + jnp.clip(value - buffer.value, -vf_clip, vf_clip)
+		value_loss_clipped = jnp.square(value_loss_clipped - returns)
+		value_loss = jnp.square(value - returns)
+		value_loss = 0.5 * jnp.mean(jnp.maximum(value_loss, value_loss_clipped))
+
+		entropy_loss = jnp.mean(dist.entropy())
+		loss = policy_loss - entropy_loss * ent_coef + value_loss * vf_coef
+		return loss, Metrics(loss, policy_loss, value_loss, entropy_loss)
+
+	grads, metrics = jax.grad(loss_fn, has_aux=True)(state.params)
+	new_state = state.apply_gradients(grads=grads)
+	return new_state, metrics
+
+
+def gen_shuffled_minibatches(key, buffer, minibatch_size, learning_steps):
+	buffer = jax.tree.map(lambda x: x.reshape((-1,) + x.shape[2:]), buffer)  # flatten
+	leaves, treedef = jax.tree.flatten(buffer)
+	assert len(leaves[0]) % minibatch_size == 0, "rollout_step must be divisible by minibatch_size"
+	for _ in range(learning_steps):
+		_, key = jax.random.split(key)
+		permutation = jax.random.permutation(key, len(leaves[0]))
+		for step in range(len(leaves[0]) // minibatch_size):
+			start = step * minibatch_size
+			end = start + minibatch_size
+			mb_leaves = [leaf[permutation][start:end] for leaf in leaves]
+			yield jax.tree.unflatten(treedef, mb_leaves)
 
 
 def main(
 	env_name: str = "Pendulum-v1",
-	num_envs: int = 4,
-	seed: int = 6561,
-	lr: float = 1e-3,
-	update_epochs: int = 4,
+	num_envs: int = 20,
+	seed: int = 42,
+	lr: float = 2e-4,
 	max_grad_norm: float = 0.5,
 	ppo_eps_clip: float = 0.2,
-	timesteps: int = 500000,
-	num_steps: int = 512,
+	ppo_vf_clip: float = 10.0,
+	vf_coef: float = 0.5,
+	ent_coef: float = 0.001,
+	gamma: float = 0.99,
+	gae_lbd: float = 0.1,
+	timesteps: int = 410000,
+	learning_steps: int = 6,
+	rollout_steps: int = 512,
+	minibatch_size: int = 64,
+	save_every: int = 20,
 ) -> None:
+	for name, value in locals().items():
+		print(f"{name}: {value}")
+
 	key = jax.random.PRNGKey(seed)
 	envs = gym.vector.SyncVectorEnv([lambda: gym.make(env_name) for _ in range(num_envs)])
 
-	f = ActorCritic(envs.single_action_space.shape[0], hidden_dim=256)
+	f = ActorCritic(envs.single_action_space.shape[0], hidden_dim=128)
 	parameters = f.init(key, jnp.zeros((1,) + envs.single_observation_space.shape))
-	print(f"Number of parameters: {sum(x.size for x in jax.tree_util.tree_leaves(parameters))}")
+	print(f"Number of learnable parameters: {sum(x.size for x in jax.tree.leaves(parameters))}")
 
 	tx = optax.chain(
 		optax.clip_by_global_norm(max_grad_norm),
-		optax.adam(lr, eps=1e-5)
+		optax.lion(lr, b1=0.9)
 	)
 	train_state = TrainState.create(
 		apply_fn=jax.jit(f.apply),
 		params=parameters,
 		tx=tx
 	)
+	manager = checkpoints.AsyncManager()
 
-	manager = checkpoints.AsyncManager(max_workers=2)
-	num_iterations = (timesteps // num_steps // num_envs)
-	best_avg_reward = -jnp.inf
-	for index in range(1, num_iterations + 1):
-		running_loss = 0
-		_, key = jax.random.split(key)
-		batch = collect_trajectory(key, envs, train_state, num_steps)
+	for epoch in range(1, (timesteps // rollout_steps // num_envs) + 1):
+		key, _sub_key = jax.random.split(key)
+		buffer = collect_trajectory_segments(_sub_key, envs, train_state, rollout_steps, gamma, gae_lbd)
 
-		permutation = jax.random.permutation(key, num_steps)
-		shuffled_batch = jax.tree.map(lambda x: jnp.take(x, permutation, axis=0), batch)
-		minibatches = jax.tree.map(lambda x: jnp.reshape(x, [update_epochs, -1] + list(x.shape[1:])), shuffled_batch)
+		running_metrics = Metrics(0, 0, 0, 0)  # reset metrics
+		minibatches = gen_shuffled_minibatches(_sub_key, buffer, minibatch_size, learning_steps)
+		for mb_transitions, mb_returns in minibatches:
+			train_state, metrics = train_step(
+				train_state,
+				mb_transitions,
+				mb_returns,
+				ppo_eps_clip,
+				ppo_vf_clip,
+				vf_coef,
+				ent_coef
+			)
+			running_metrics = jax.tree.map(lambda x, y: x + float(y), running_metrics, metrics)
 
-		for step in range(update_epochs):
-			transitions = jax.tree.map(lambda x: jnp.take(x, step, axis=0), minibatches[0])
-			returns = minibatches[1][step]
-			loss, train_state = train_step(train_state, transitions, returns, ppo_eps_clip)
-			running_loss = running_loss + loss
-		avg_reward = transitions.reward.mean()
+		print(f"#{epoch:02}\t{buffer[0].reward.mean():.3f} {running_metrics}")
 
-		print(f"#{index:02}\tloss: {running_loss:.3f}  avg_reward: {avg_reward:.3f}")
-
-		if avg_reward > best_avg_reward:
-			checkpoints.save_checkpoint(os.path.abspath("."), train_state.params, step=index, overwrite=True, async_manager=manager)
-			best_avg_reward = avg_reward
+		if epoch % save_every == 0:
+			checkpoints.save_checkpoint(Path().resolve(), train_state.params, step=epoch, overwrite=True, async_manager=manager)
 
 
 if __name__ == "__main__":
