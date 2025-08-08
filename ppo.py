@@ -1,8 +1,9 @@
 from flax.training.train_state import TrainState
+from flax.traverse_util import path_aware_map
 from flax.training import checkpoints
-from typing import NamedTuple, Tuple
-from pathlib import Path
 from functools import partial
+from pathlib import Path
+from typing import NamedTuple, Tuple
 from model import ActorCritic
 
 import jax
@@ -11,7 +12,6 @@ import gymnasium as gym
 import distrax
 import optax
 import wandb
-import time
 import tqdm
 import fire
 
@@ -27,24 +27,21 @@ class Transition(NamedTuple):
 
 def collect_trajectory_segments(
 	key: jax.random.PRNGKey,
-	envs: gym.vector.SyncVectorEnv,
 	state: TrainState,
+	envs: gym.vector.SyncVectorEnv,
 	rollout_steps: int,
 	gamma: float,
-	gae_lbd: float
+	gae_lam: float
 ) -> Tuple[Transition, jax.Array]:
 	last_obs, _ = envs.reset()
-	action_lo = envs.single_action_space.low
-	action_hi = envs.single_action_space.high
 	buffer = []
 	stats = []
 
-	for s in range(rollout_steps):
-		_, key = jax.random.split(key)
+	for _ in range(rollout_steps):
+		key, _sub_key = jax.random.split(key)
 		mu, logstd, value = state.apply_fn(state.params, last_obs)
 		dist = distrax.MultivariateNormalDiag(mu, jnp.exp(logstd))
-		action = jnp.clip(dist.sample(seed=key), action_lo, action_hi)
-		log_prob = dist.log_prob(action)
+		action = dist.sample(seed=_sub_key)
 
 		obs, reward, terminated, truncated, infos = envs.step(action)
 		buffer.append(Transition(
@@ -52,26 +49,25 @@ def collect_trajectory_segments(
 			action,
 			value,
 			reward,
-			log_prob,
+			dist.log_prob(action),
 			last_obs
 		))
 
 		last_obs = obs
-		if infos:
-			stats.append(infos)
+		stats.append(infos)
 
 	_, _, last_value = state.apply_fn(state.params, last_obs)
 	buffer = jax.tree.map(lambda *x: jnp.stack(x), *buffer)
+	returns = jnp.zeros_like(buffer.value)
+	mask = 1.0 - buffer.done
 	gae = 0
-	returns = []
 	for s in reversed(range(rollout_steps)):
-		value_tp = last_value if s == rollout_steps - 1 else buffer.value[s + 1]
-		mask = 1.0 - buffer.done[s]
-		delta = buffer.reward[s] + gamma * value_tp * mask - buffer.value[s]
-		gae = delta + gamma * gae_lbd * mask * gae
-		returns.insert(0, gae + buffer.value[s])
+		value_tp = buffer.value[s + 1] if s != rollout_steps - 1 else last_value
+		delta = buffer.reward[s] + gamma * value_tp * mask[s] - buffer.value[s]
+		gae = delta + gamma * gae_lam * mask[s] * gae
+		returns = returns.at[s].set(gae + buffer.value[s])
 
-	return (buffer, jnp.array(returns)), stats
+	return (buffer, returns), list(filter(bool, stats))
 
 
 @partial(jax.jit, static_argnums=[3, 4, 5, 6])
@@ -93,9 +89,11 @@ def train_step(
 
 		advantages = returns - buffer.value
 		advantages = (advantages - advantages.mean()) / (1e-7 + advantages.std())
-		surr1 = -advantages * ratios
-		surr2 = -advantages * ratios.clip(1 - eps_clip, 1 + eps_clip)
-		policy_loss = jnp.mean(jnp.maximum(surr1, surr2))
+
+		surr = jnp.minimum(advantages * ratios, advantages * jnp.clip(ratios, 1 - eps_clip, 1 + eps_clip))
+		clipped = jnp.clip(eps_clip * jnp.exp(-jnp.mean(buffer.log_prob - log_prob)), 0.05, 0.3)
+		policy_loss = jnp.where(advantages <= 0, jnp.maximum(surr, advantages * clipped), surr)
+		policy_loss = -jnp.mean(policy_loss)
 
 		value_loss_clipped = buffer.value + jnp.clip(value - buffer.value, -vf_clip, vf_clip)
 		value_loss_clipped = jnp.square(value_loss_clipped - returns)
@@ -112,60 +110,69 @@ def train_step(
 
 
 def gen_shuffled_minibatches(key, buffer, minibatch_size, learning_steps):
-	buffer = jax.tree.map(lambda x: x.reshape((-1,) + x.shape[2:]), buffer)  # flatten
-	leaves, treedef = jax.tree.flatten(buffer)
-	assert len(leaves[0]) % minibatch_size == 0, "rollout_steps must be divisible by minibatch_size"
+	buffer_flat = jax.tree.map(lambda x: x.reshape((-1,) + x.shape[2:]), buffer)
+	n_samples = jax.tree.leaves(buffer_flat)[0].shape[0]
+	num_minibatches = n_samples // minibatch_size
+	assert n_samples % minibatch_size == 0, "rollout_steps must be divisible by minibatch_size"
 	for _ in range(learning_steps):
 		key, _sub_key = jax.random.split(key)
-		permutation = jax.random.permutation(_sub_key, len(leaves[0]))
-		for step in range(len(leaves[0]) // minibatch_size):
-			start = step * minibatch_size
-			end = start + minibatch_size
-			mini_leaves = [leaf[permutation][start:end] for leaf in leaves]
-			yield jax.tree.unflatten(treedef, mini_leaves)
+		perms = jax.random.permutation(_sub_key, n_samples)
+		mb = jax.tree.map(lambda x: x[perms].reshape((num_minibatches, minibatch_size) + x.shape[1:]), buffer_flat)
+		for idx in range(num_minibatches):
+			yield jax.tree.map(lambda x: x[idx], mb)
 
 
-def create_env(name: str, reward_clip_range: Tuple[float, float], **kwargs) -> gym.Env:
+def create_env(name: str, reward_range: Tuple[float, float], **kwargs):
 	env = gym.make(name, **kwargs)
 	env = gym.wrappers.RecordEpisodeStatistics(env)
-	env = gym.wrappers.NormalizeReward(env)
-	env = gym.wrappers.ClipReward(env, *reward_clip_range)
+	env = gym.wrappers.TransformReward(env, lambda r: r * 0.1)
+	env = gym.wrappers.ClipReward(env, *reward_range)
 	return env
 
 
 def main(
-	env_name: str = "Pendulum-v1",
+	env_name: str = "LunarLander-v3",
 	num_envs: int = 20,
 	seed: int = 42,
-	actor_hidden_dims: Tuple[int] = (256,),
-	critic_hidden_dims: Tuple[int] = (128, 64, 128, 64, 128),
-	reward_clip_range: Tuple[float, float] = (-10, 10),
+	reward_range: Tuple[float, float] = (-100, 100),
 	lr: float = 1e-3,
+	schedule_warmup_steps: int = 200_000,
+	schedule_total_steps: int = 2_000_000,
 	max_grad_norm: float = 0.5,
 	eps_clip: float = 0.2,
-	vf_clip: float = 1.0,
-	vf_coef: float = 0.5,
+	vf_clip: float = 2.0,
+	vf_coef: float = 1.0,
 	ent_coef: float = 0.01,
 	gamma: float = 0.99,
-	gae_lbd: float = 0.9,
-	timesteps: int = 500000,
-	learning_steps: int = 6,
-	rollout_steps: int = 512,
+	gae_lam: float = 0.95,
+	timesteps: int = 3_000_000,
+	learning_steps: int = 4,
+	rollout_steps: int = 1024,
 	minibatch_size: int = 64,
 	save_every: int = 20,
 	ckpt_dir: str = "checkpoints/",
 ) -> None:
-	config = locals()
-	key = jax.random.PRNGKey(seed)
-	envs = gym.vector.SyncVectorEnv([lambda: create_env(env_name, reward_clip_range, continuous=True) for _ in range(num_envs)])
+	run = wandb.init(project=f"{env_name}-PPO", config=locals())
+	envs = gym.vector.SyncVectorEnv([lambda: create_env(env_name, reward_range, continuous=True) for _ in range(num_envs)])
+	f = ActorCritic(envs.single_action_space.shape[0])
 
-	f = ActorCritic(envs.single_action_space.shape[0], actor_hidden_dims, critic_hidden_dims)
-	parameters = f.init(key, jnp.zeros((1,) + envs.single_observation_space.shape))
+	key = jax.random.PRNGKey(seed)
+	parameters = f.init(key, jnp.zeros((1,) + jnp.shape(envs.single_observation_space)))
 	print(f"Number of learnable parameters: {sum(x.size for x in jax.tree.leaves(parameters))}")
 
+	schedule = optax.warmup_cosine_decay_schedule(
+		init_value=0,
+		peak_value=lr,
+		warmup_steps=schedule_warmup_steps // rollout_steps // num_envs * learning_steps,
+		decay_steps=(schedule_total_steps - schedule_warmup_steps) // rollout_steps // num_envs * learning_steps,
+		end_value=1e-4
+	)
 	tx = optax.chain(
 		optax.clip_by_global_norm(max_grad_norm),
-		optax.adam(lr, b1=0.9, eps=1e-5)
+		optax.multi_transform({
+			"adam": optax.adamw(schedule, b1=0.9, eps=1e-7),
+			"muon": optax.contrib.muon(schedule, eps=1e-7, adam_weight_decay=0.0001)
+		}, path_aware_map(lambda path, _: "adam" if any(p.startswith("IO") for p in path) else "muon", parameters))
 	)
 	train_state = TrainState.create(
 		apply_fn=jax.jit(f.apply),
@@ -173,16 +180,15 @@ def main(
 		tx=tx
 	)
 	ckpt_manager = checkpoints.AsyncManager()
-	run = wandb.init(project=f"{env_name}-PPO", config=config, name=f"{env_name}_{int(time.time())}")
 
 	for epoch in tqdm.tqdm(range(1, (timesteps // rollout_steps // num_envs) + 1)):
 		key, _sub_key = jax.random.split(key)
-		buffer, stats = collect_trajectory_segments(_sub_key, envs, train_state, rollout_steps, gamma, gae_lbd)
+		buffer, stats = collect_trajectory_segments(_sub_key, train_state, envs, rollout_steps, gamma, gae_lam)
 
-		running_losses = [0, 0, 0]  # reset losses
+		running_losses = []  # reset losses
 		minibatches = gen_shuffled_minibatches(_sub_key, buffer, minibatch_size, learning_steps)
 		for transitions, returns in minibatches:
-			train_state, (policy_loss, value_loss, entropy_loss) = train_step(
+			train_state, losses = train_step(
 				train_state,
 				transitions,
 				returns,
@@ -191,17 +197,16 @@ def main(
 				vf_coef,
 				ent_coef
 			)
-			running_losses[0] = running_losses[0] + policy_loss
-			running_losses[1] = running_losses[1] + value_loss
-			running_losses[2] = running_losses[2] + entropy_loss
+			running_losses.append(losses)
 
+		policy_loss, value_loss, entropy_loss = map(lambda x: sum(x) / len(x), zip(*running_losses))
 		metrics = {
 			"avg_episodic_return": jnp.stack([x["episode"]["r"] for x in stats]).mean() if stats else jnp.nan,
-			"losses/policy_loss": running_losses[0],
-			"losses/value_loss": running_losses[1],
-			"losses/entropy_loss": running_losses[2]
+			"losses/policy_loss" : policy_loss,
+			"losses/value_loss"  : value_loss,
+			"losses/entropy_loss": entropy_loss
 		}
-		wandb.log(metrics, step=int(epoch * rollout_steps * num_envs))
+		wandb.log(metrics, step=int(epoch * rollout_steps * num_envs), commit=True)
 		if epoch % save_every == 0:
 			checkpoints.save_checkpoint(
 				Path(ckpt_dir).resolve(),
